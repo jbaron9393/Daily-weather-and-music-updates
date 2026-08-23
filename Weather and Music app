@@ -1,0 +1,994 @@
+function sendMorningNewsAndWeather() {
+  const RECIPIENT = "james.baron@cuanschutz.edu";
+  const LAT = 39.7093;
+  const LON = -104.8146;
+  const TZ = "America/Denver";
+
+  const headers = {
+    "User-Agent": "MorningNewsWeatherEmail/1.0 (james.baron@cuanschutz.edu)",
+    "Accept": "application/xml, text/xml, application/rss+xml, application/json, text/html"
+  };
+
+  const weather = getWeatherSummary(LAT, LON, headers);
+
+  const topCandidates = getSectionArticles("https://abcnews.go.com/", "Top", headers, 12);
+  const usCandidates = getSectionArticles("https://abcnews.go.com/us", "U.S.", headers, 20);
+  const internationalCandidates = getSectionArticles("https://abcnews.go.com/international", "International", headers, 20);
+  const politicsCandidates = getSectionArticles("https://abcnews.go.com/politics", "Politics", headers, 20);
+  const businessCandidates = getSectionArticles("https://abcnews.go.com/business", "Business", headers, 20);
+  const lifestyleCandidates = getSectionArticles("https://abcnews.go.com/lifestyle", "Lifestyle", headers, 20);
+
+  const chosen = [];
+  const seen = new Set();
+
+  takeFromPool(chosen, seen, topCandidates, 1);
+  takeFromPool(chosen, seen, usCandidates, 2);
+  takeFromPool(chosen, seen, internationalCandidates, 2);
+
+  // Fill remaining 5 from politics, business, lifestyle in round-robin
+  fillRoundRobin(chosen, seen, [politicsCandidates, businessCandidates, lifestyleCandidates], 10);
+
+  // If still short, use leftovers from all category pools
+  fillRoundRobin(
+    chosen,
+    seen,
+    [usCandidates, internationalCandidates, politicsCandidates, businessCandidates, lifestyleCandidates, topCandidates],
+    10
+  );
+
+  const enrichedItems = enrichArticles(chosen, headers, 10);
+
+  if (enrichedItems.length < 10) {
+    Logger.log(`Only found ${enrichedItems.length} valid articles today after filtering.`);
+  }
+
+  const today = Utilities.formatDate(new Date(), TZ, "MMMM d, yyyy");
+  const subject = today;
+
+  const { htmlBody, plainBody, inlineImages } = buildEmail(weather, enrichedItems, today);
+
+  MailApp.sendEmail({
+    to: RECIPIENT,
+    subject,
+    body: plainBody,
+    htmlBody,
+    inlineImages,
+    name: "🌞Morning Update🌞"
+  });
+}
+
+/* =========================
+   SECTION SCRAPING
+========================= */
+
+function getSectionArticles(url, categoryLabel, headers, maxItems) {
+  try {
+    const resp = UrlFetchApp.fetch(url, {
+      method: "get",
+      headers,
+      muteHttpExceptions: true,
+      followRedirects: true
+    });
+
+    if (resp.getResponseCode() < 200 || resp.getResponseCode() >= 300) {
+      Logger.log(`Failed section fetch: ${url}`);
+      return [];
+    }
+
+    const html = resp.getContentText();
+    let items = [];
+
+    // First try JSON-LD Article extraction
+    items = items.concat(extractArticlesFromJsonLd(html, url, categoryLabel));
+
+    // Then try anchor/title scraping
+    items = items.concat(extractArticlesFromAnchors(html, url, categoryLabel));
+
+    // De-duplicate and filter hard
+    const deduped = dedupeArticles(items)
+      .filter(isLikelyRealArticleFromFeed)
+      .slice(0, maxItems);
+
+    return deduped;
+  } catch (e) {
+    Logger.log(`Error fetching section ${url}: ${e}`);
+    return [];
+  }
+}
+
+function extractArticlesFromJsonLd(html, baseUrl, categoryLabel) {
+  const out = [];
+  const scripts = html.match(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi) || [];
+
+  for (let i = 0; i < scripts.length; i++) {
+    const raw = scripts[i].replace(/<\/?script[^>]*>/gi, "").trim();
+    try {
+      const parsed = JSON.parse(raw);
+      collectJsonLdArticles(parsed, out, baseUrl, categoryLabel);
+    } catch (e) {
+      // ignore malformed json-ld
+    }
+  }
+
+  return out;
+}
+
+function collectJsonLdArticles(node, out, baseUrl, categoryLabel) {
+  if (!node) return;
+
+  if (Array.isArray(node)) {
+    node.forEach(n => collectJsonLdArticles(n, out, baseUrl, categoryLabel));
+    return;
+  }
+
+  if (typeof node !== "object") return;
+
+  const type = Array.isArray(node["@type"]) ? node["@type"].join(" ") : String(node["@type"] || "");
+  const isArticleish = /Article|NewsArticle|ReportageNewsArticle/i.test(type);
+
+  if (isArticleish) {
+    const title = cleanHeadline(cleanText(node.headline || node.name || ""));
+    const link = absolutizeUrl(node.url || "", baseUrl);
+    const description = cleanText(node.description || "");
+
+    if (title && link) {
+      out.push({
+        title,
+        link,
+        description,
+        category: categoryLabel
+      });
+    }
+  }
+
+  Object.keys(node).forEach(key => collectJsonLdArticles(node[key], out, baseUrl, categoryLabel));
+}
+
+function extractArticlesFromAnchors(html, baseUrl, categoryLabel) {
+  const out = [];
+  const anchorRe = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let match;
+
+  while ((match = anchorRe.exec(html)) !== null) {
+    const href = absolutizeUrl(match[1], baseUrl);
+    const text = cleanHeadline(cleanArticleText(stripHtml(match[2])));
+
+    if (!href || !text) continue;
+    if (!looksLikeAbcArticleUrl(href)) continue;
+    if (text.length < 25) continue;
+    if (isLikelyNonArticleTitle(text, href)) continue;
+
+    out.push({
+      title: text,
+      link: href,
+      description: "",
+      category: categoryLabel
+    });
+
+    if (out.length >= 40) break;
+  }
+
+  return out;
+}
+
+function looksLikeAbcArticleUrl(url) {
+  const u = String(url || "").toLowerCase();
+
+  if (!/abcnews\.go\.com|abcnews\.com/.test(u)) return false;
+  if (/\/video\//.test(u)) return false;
+  if (/\/live\//.test(u)) return false;
+  if (/\/photos\//.test(u)) return false;
+  if (/\/gallery\//.test(u)) return false;
+  if (/\/slideshow\//.test(u)) return false;
+  if (/\/playlist\//.test(u)) return false;
+  if (/\/shop\//.test(u)) return false;
+  if (/\/author\//.test(u)) return false;
+  if (/\/tag\//.test(u)) return false;
+
+  // Many ABC article links use story?id=
+  if (/story\?id=/.test(u)) return true;
+
+  // Also allow article-like paths on abcnews.com
+  if (/abcnews\.com\/[a-z0-9\-\/]+/.test(u)) return true;
+
+  return false;
+}
+
+function isLikelyNonArticleTitle(title, href) {
+  const t = String(title || "").toLowerCase();
+  const u = String(href || "").toLowerCase();
+
+  return (
+    /\b(video|watch live|playlist|photos|gallery|slideshow|shop|listen)\b/.test(t) ||
+    /\/video\//.test(u) ||
+    /\/live\//.test(u) ||
+    /\/photos\//.test(u) ||
+    /\/gallery\//.test(u) ||
+    /\/slideshow\//.test(u)
+  );
+}
+
+function dedupeArticles(items) {
+  const seen = new Set();
+  const out = [];
+
+  items.forEach(item => {
+    const key = normalizeUrlKey(item.link) || normalizeTitleKey(item.title);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push(item);
+  });
+
+  return out;
+}
+
+function normalizeUrlKey(url) {
+  if (!url) return "";
+  return String(url)
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/[?#].*$/, "")
+    .replace(/\/+$/, "")
+    .trim();
+}
+
+function normalizeTitleKey(title) {
+  return cleanArticleText(title || "").toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
+}
+
+function absolutizeUrl(url, baseUrl) {
+  if (!url) return "";
+  if (/^https?:\/\//i.test(url)) return url;
+  if (url.startsWith("//")) return "https:" + url;
+  if (url.startsWith("/")) {
+    const root = getRootUrl(baseUrl);
+    return root + url;
+  }
+  return getRootUrl(baseUrl) + "/" + url.replace(/^\/+/, "");
+}
+
+function getRootUrl(url) {
+  const m = String(url).match(/^(https?:\/\/[^\/]+)/i);
+  return m ? m[1] : "https://abcnews.go.com";
+}
+
+function takeFromPool(chosen, seen, pool, count) {
+  for (let i = 0; i < pool.length && count > 0; i++) {
+    const item = pool[i];
+    const key = normalizeUrlKey(item.link);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    chosen.push(item);
+    count--;
+  }
+}
+
+function fillRoundRobin(chosen, seen, pools, targetTotal) {
+  const indices = new Array(pools.length).fill(0);
+  let progress = true;
+
+  while (chosen.length < targetTotal && progress) {
+    progress = false;
+
+    for (let p = 0; p < pools.length; p++) {
+      while (indices[p] < pools[p].length) {
+        const item = pools[p][indices[p]++];
+        const key = normalizeUrlKey(item.link);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        chosen.push(item);
+        progress = true;
+        break;
+      }
+
+      if (chosen.length >= targetTotal) break;
+    }
+  }
+}
+
+/* =========================
+   WEATHER
+========================= */
+
+function getWeatherSummary(lat, lon, headers) {
+  const TZ = "America/Denver";
+
+  const pointUrl = `https://api.weather.gov/points/${lat},${lon}`;
+  const pointJson = fetchJson(pointUrl, headers) || {};
+  const props = pointJson.properties || {};
+
+  const forecastUrl = props.forecast;
+  const forecastHourlyUrl = props.forecastHourly;
+  const stationsUrl = props.observationStations;
+
+  const relativeLocation = props.relativeLocation && props.relativeLocation.properties
+    ? props.relativeLocation.properties
+    : {};
+  const city = relativeLocation.city || "Glendale/Aurora";
+  const state = relativeLocation.state || "CO";
+  const location = `${city}, ${state}`;
+
+  let current = "Unavailable";
+  let updated = "";
+  let wind = "Unavailable";
+
+  if (stationsUrl) {
+    const stationsJson = fetchJson(stationsUrl, headers) || {};
+    const firstStation = stationsJson.observationStations && stationsJson.observationStations[0];
+
+    if (firstStation) {
+      const obsJson = fetchJson(`${firstStation}/observations/latest`, headers) || {};
+      const o = obsJson.properties || {};
+
+      const tempC = o.temperature && o.temperature.value;
+      const tempF = tempC !== null && tempC !== undefined ? Math.round((tempC * 9) / 5 + 32) : null;
+
+      const desc = o.textDescription || "Current conditions";
+      current = `${desc}${tempF !== null ? `, ${tempF}°F` : ""}`;
+
+      const windMs = o.windSpeed && o.windSpeed.value;
+      const windMph = windMs !== null && windMs !== undefined ? Math.round(windMs * 2.23694) : null;
+      const windDeg = o.windDirection && o.windDirection.value;
+      const windDir = windDeg !== null && windDeg !== undefined ? degreesToCardinal(windDeg) : "";
+
+      if (windMph !== null) {
+        wind = `${windMph} mph${windDir ? ` ${windDir}` : ""}`;
+      }
+
+      if (o.timestamp) {
+        updated = Utilities.formatDate(new Date(o.timestamp), TZ, "MMM d, yyyy h:mm a z");
+      }
+    }
+  }
+
+  let high = "Unavailable";
+  let low = "Unavailable";
+  let precipChance = "Unavailable";
+
+  if (forecastUrl) {
+    const dailyJson = fetchJson(forecastUrl, headers) || {};
+    const periods = dailyJson.properties && dailyJson.properties.periods ? dailyJson.properties.periods : [];
+
+    const todayKey = Utilities.formatDate(new Date(), TZ, "yyyy-MM-dd");
+    const dayPeriod = periods.find(p =>
+      p.isDaytime &&
+      Utilities.formatDate(new Date(p.startTime), TZ, "yyyy-MM-dd") === todayKey
+    ) || periods.find(p => p.isDaytime);
+
+    const nightPeriod = periods.find(p => {
+      if (p.isDaytime) return false;
+      const d = new Date(p.startTime);
+      return d > new Date();
+    }) || periods.find(p => !p.isDaytime);
+
+    if (dayPeriod && dayPeriod.temperature !== undefined) {
+      high = `${dayPeriod.temperature}°${dayPeriod.temperatureUnit || "F"}`;
+      const pop = dayPeriod.probabilityOfPrecipitation && dayPeriod.probabilityOfPrecipitation.value;
+      if (pop !== null && pop !== undefined) precipChance = `${Math.round(pop)}%`;
+    }
+
+    if (nightPeriod && nightPeriod.temperature !== undefined) {
+      low = `${nightPeriod.temperature}°${nightPeriod.temperatureUnit || "F"}`;
+    }
+  }
+
+  let forecast3pm = "Unavailable";
+  if (forecastHourlyUrl) {
+    const hourlyJson = fetchJson(forecastHourlyUrl, headers) || {};
+    const periods = hourlyJson.properties && hourlyJson.properties.periods ? hourlyJson.properties.periods : [];
+    const at3pm = findBest3PmPeriod(periods, TZ);
+
+    if (at3pm) {
+      const temp = at3pm.temperature !== undefined ? `${at3pm.temperature}°${at3pm.temperatureUnit || "F"}` : "";
+      const cond = at3pm.shortForecast || "Forecast";
+      const pop = at3pm.probabilityOfPrecipitation && at3pm.probabilityOfPrecipitation.value;
+      const popText = pop !== null && pop !== undefined ? `, precip ${Math.round(pop)}%` : "";
+      forecast3pm = `${cond}${temp ? `, ${temp}` : ""}${popText}`;
+    }
+  }
+
+  const sun = getSunriseSunset(lat, lon, TZ);
+  const sunrise = sun.sunrise;
+  const sunset = sun.sunset;
+
+  const summary =
+    `Now: ${current}. ` +
+    `3:00 PM: ${forecast3pm}. ` +
+    `High/Low: ${high}/${low}. ` +
+    `Wind: ${wind}. ` +
+    `Precipitation chance: ${precipChance}. ` +
+    `Sunrise ${sunrise}, Sunset ${sunset}.`;
+
+  return {
+    location,
+    current,
+    forecast3pm,
+    high,
+    low,
+    wind,
+    precipChance,
+    sunrise,
+    sunset,
+    updated,
+    summary
+  };
+}
+
+function fetchJson(url, headers) {
+  try {
+    const resp = UrlFetchApp.fetch(url, {
+      method: "get",
+      headers: headers || {},
+      muteHttpExceptions: true,
+      followRedirects: true
+    });
+    const code = resp.getResponseCode();
+    if (code < 200 || code >= 300) return null;
+    return JSON.parse(resp.getContentText());
+  } catch (e) {
+    return null;
+  }
+}
+
+function findBest3PmPeriod(periods, tz) {
+  if (!periods || !periods.length) return null;
+
+  const now = new Date();
+  const todayKey = Utilities.formatDate(now, tz, "yyyy-MM-dd");
+
+  const today3 = periods.find(p => {
+    const d = new Date(p.startTime);
+    const hour = Number(Utilities.formatDate(d, tz, "H"));
+    const key = Utilities.formatDate(d, tz, "yyyy-MM-dd");
+    return key === todayKey && hour === 15 && d >= now;
+  });
+  if (today3) return today3;
+
+  const next3 = periods.find(p => {
+    const d = new Date(p.startTime);
+    const hour = Number(Utilities.formatDate(d, tz, "H"));
+    return d > now && hour === 15;
+  });
+  if (next3) return next3;
+
+  return periods[0];
+}
+
+function getSunriseSunset(lat, lon, tz) {
+  const url = `https://api.sunrise-sunset.org/json?lat=${lat}&lng=${lon}&formatted=0`;
+  const json = fetchJson(url, {});
+  if (!json || json.status !== "OK" || !json.results) {
+    return { sunrise: "Unavailable", sunset: "Unavailable" };
+  }
+
+  return {
+    sunrise: Utilities.formatDate(new Date(json.results.sunrise), tz, "h:mm a"),
+    sunset: Utilities.formatDate(new Date(json.results.sunset), tz, "h:mm a")
+  };
+}
+
+function degreesToCardinal(deg) {
+  const dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+  const normalized = (((deg % 360) + 360) % 360);
+  const index = Math.round(normalized / 45) % 8;
+  return dirs[index];
+}
+
+/* =========================
+   ARTICLE ENRICHMENT
+========================= */
+
+function enrichArticles(items, headers, desiredCount) {
+  const requests = items.map(item => ({
+    url: item.link,
+    method: "get",
+    headers,
+    muteHttpExceptions: true,
+    followRedirects: true
+  }));
+
+  const responses = UrlFetchApp.fetchAll(requests);
+
+  const enriched = items
+    .map((item, i) => {
+      try {
+        const resp = responses[i];
+        const code = resp.getResponseCode();
+        if (code < 200 || code >= 300) return null;
+
+        const html = resp.getContentText();
+        if (!html || isClearlyNonArticlePage(item, html)) return null;
+
+        const imageUrl =
+          extractMetaTag(html, "property", "og:image") ||
+          extractMetaTag(html, "name", "twitter:image") ||
+          "";
+
+        const metaDescription =
+          extractMetaTag(html, "property", "og:description") ||
+          extractMetaTag(html, "name", "description") ||
+          item.description ||
+          "";
+
+        const paragraphText = extractVisibleParagraphs(html);
+        const jsonLdBody = extractJsonLdArticleText(html);
+        const articleText = jsonLdBody || paragraphText || metaDescription || item.description || "";
+
+        if (!hasEnoughArticleText(paragraphText, jsonLdBody, metaDescription)) return null;
+
+        const summary = buildSummary(articleText, metaDescription, item.title);
+        if (!summary || summary === "Summary unavailable for this article.") return null;
+
+        return {
+          ...item,
+          imageUrl,
+          description: metaDescription,
+          summary
+        };
+      } catch (err) {
+        return null;
+      }
+    })
+    .filter(Boolean);
+
+  return desiredCount ? enriched.slice(0, desiredCount) : enriched;
+}
+
+function isLikelyRealArticleFromFeed(item) {
+  const title = String(item.title || "").toLowerCase();
+  const link = String(item.link || "").toLowerCase();
+  const desc = String(item.description || "").toLowerCase();
+  const combined = `${title} ${link} ${desc}`;
+
+  if (!link) return false;
+
+  if (
+    /\b(video|watch live|live updates|livestream|playlist|photos|gallery|slideshow|shop|listen)\b/.test(combined) ||
+    /\/video\//.test(link) ||
+    /\/live\//.test(link) ||
+    /\/photos\//.test(link) ||
+    /\/gallery\//.test(link) ||
+    /\/slideshow\//.test(link)
+  ) {
+    return false;
+  }
+
+  if (
+    /story\?id=/.test(link) ||
+    /abcnews\.go\.com\/[^\/]+\/[^\/]+/.test(link) ||
+    /abcnews\.com\/[^\/]+\/[^\/]+/.test(link)
+  ) {
+    return true;
+  }
+
+  return !/\b(video|watch|playlist|photos|gallery)\b/.test(title);
+}
+
+function isClearlyNonArticlePage(item, html) {
+  const title = String(item.title || "");
+  const text = cleanArticleText(stripHtml(String(html || "").slice(0, 25000))).toLowerCase();
+  const url = String(item.link || "").toLowerCase();
+
+  if (
+    /from here you can either hit the "back" button/.test(text) ||
+    /visit the abcnews\.com home page/.test(text) ||
+    /search for something on our site/.test(text) ||
+    /\b404\b/.test(text) ||
+    /page not found/.test(text)
+  ) {
+    return true;
+  }
+
+  if (
+    /\/video\//.test(url) ||
+    /\/live\//.test(url) ||
+    /\/photos\//.test(url) ||
+    /\/gallery\//.test(url) ||
+    /\/slideshow\//.test(url)
+  ) {
+    return true;
+  }
+
+  if (/\b(video|watch live|playlist|slideshow|gallery|photos)\b/i.test(title)) {
+    return true;
+  }
+
+  const paragraphs = getUsableParagraphsFromHtml(html);
+  if (paragraphs.length < 2) return true;
+
+  const joined = paragraphs.join(" ");
+  const wordCount = joined.split(/\s+/).filter(Boolean).length;
+  if (wordCount < 140) return true;
+
+  return false;
+}
+
+function getUsableParagraphsFromHtml(html) {
+  let text = String(html || "");
+  text = text.replace(/<script[\s\S]*?<\/script>/gi, " ");
+  text = text.replace(/<style[\s\S]*?<\/style>/gi, " ");
+
+  const paragraphs = [];
+  const re = /<p\b[^>]*>([\s\S]*?)<\/p>/gi;
+  let match;
+
+  while ((match = re.exec(text)) !== null) {
+    const cleaned = cleanArticleText(stripHtml(match[1]));
+    if (
+      cleaned &&
+      cleaned.length > 80 &&
+      !/cookie|advertis|newsletter|sign up|terms|privacy|accept all|continue reading|video|watch on/i.test(cleaned)
+    ) {
+      paragraphs.push(cleaned);
+    }
+    if (paragraphs.length >= 12) break;
+  }
+
+  return paragraphs;
+}
+
+function hasEnoughArticleText(paragraphText, jsonLdBody, metaDescription) {
+  const paraWords = String(paragraphText || "").split(/\s+/).filter(Boolean).length;
+  const jsonWords = String(jsonLdBody || "").split(/\s+/).filter(Boolean).length;
+  const metaWords = String(metaDescription || "").split(/\s+/).filter(Boolean).length;
+
+  if (jsonWords >= 120) return true;
+  if (paraWords >= 140) return true;
+  if (paraWords < 80 && jsonWords < 80 && metaWords < 18) return false;
+
+  return false;
+}
+
+function extractMetaTag(html, attrName, attrValue) {
+  const re = new RegExp(
+    `<meta[^>]*${attrName}=["']${escapeRegex(attrValue)}["'][^>]*content=["']([^"']+)["'][^>]*>`,
+    "i"
+  );
+  const match = html.match(re);
+  return match ? decodeHtml(match[1]).trim() : "";
+}
+
+function extractJsonLdArticleText(html) {
+  const matches = html.match(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi);
+  if (!matches) return "";
+
+  for (let i = 0; i < matches.length; i++) {
+    const block = matches[i].replace(/<\/?script[^>]*>/gi, "").trim();
+    try {
+      const parsed = JSON.parse(block);
+      const found = findArticleBodyInJson(parsed);
+      if (found) return cleanArticleText(found);
+    } catch (e) {
+      // ignore invalid json-ld
+    }
+  }
+
+  return "";
+}
+
+function findArticleBodyInJson(obj) {
+  if (!obj) return "";
+
+  if (Array.isArray(obj)) {
+    for (let i = 0; i < obj.length; i++) {
+      const found = findArticleBodyInJson(obj[i]);
+      if (found) return found;
+    }
+    return "";
+  }
+
+  if (typeof obj === "object") {
+    if (obj.articleBody && typeof obj.articleBody === "string") return obj.articleBody;
+    for (const key in obj) {
+      const found = findArticleBodyInJson(obj[key]);
+      if (found) return found;
+    }
+  }
+
+  return "";
+}
+
+function extractVisibleParagraphs(html) {
+  return getUsableParagraphsFromHtml(html).join(" ");
+}
+
+/* =========================
+   SUMMARY
+========================= */
+
+function buildSummary(articleText, description, title) {
+  const cleanTitle = cleanHeadline(cleanArticleText(title || ""));
+  let source = cleanArticleText(`${articleText || ""} ${description || ""}`);
+
+  if (cleanTitle) {
+    source = source.replace(new RegExp(escapeRegex(cleanTitle), "gi"), " ");
+  }
+
+  source = source
+    .replace(/\bwatch:\s*/gi, "")
+    .replace(/\bvideo:\s*/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!source) return "Summary unavailable for this article.";
+
+  const rawSentences = splitIntoSentences(source)
+    .map(normalizeSentence)
+    .filter(isFullSentence);
+
+  const picked = [];
+  for (let i = 0; i < rawSentences.length && picked.length < 3; i++) {
+    const s = rawSentences[i];
+    if (!isNearDuplicateSentence(s, picked)) picked.push(s);
+  }
+
+  if (picked.length === 0) {
+    const fallback = normalizeSentence(source.split(/\s+/).slice(0, 25).join(" "));
+    if (isFullSentence(fallback)) picked.push(fallback);
+  }
+
+  return picked.length ? picked.join(" ") : "Summary unavailable for this article.";
+}
+
+function isFullSentence(sentence) {
+  const s = cleanArticleText(sentence);
+  const wc = s.split(/\s+/).filter(Boolean).length;
+  if (wc < 8 || wc > 45) return false;
+  if (!/[.!?]$/.test(s)) return false;
+  if (/back button|home page|search for something on our site|click here|read more/i.test(s)) return false;
+
+  const hasVerb =
+    /\b(is|are|was|were|be|been|being|has|have|had|does|do|did|will|would|can|could|should|may|might|said|says|reported|announced|discussed|revealed|explained|described|showed|shows)\b/i.test(s) ||
+    /\b\w+(ed|ing)\b/i.test(s);
+
+  return hasVerb;
+}
+
+function normalizeSentence(sentence) {
+  let s = cleanArticleText(sentence)
+    .replace(/\s+([,.;:!?])/g, "$1")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+
+  if (!s) return "";
+  s = s.charAt(0).toUpperCase() + s.slice(1);
+  if (!/[.!?]$/.test(s)) s += ".";
+  return s;
+}
+
+/* =========================
+   EMAIL BUILDING
+========================= */
+
+function buildEmail(weather, items, today) {
+  const inlineImages = {};
+
+  let html = `
+  <html>
+    <head>
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    </head>
+    <body style="margin:0;padding:0;background:#eef2f7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1f2937;">
+      <div style="width:100%;background:#eef2f7;padding:12px 8px 24px 8px;box-sizing:border-box;">
+        <div style="max-width:680px;margin:0 auto;">
+
+          <div style="background:#ffffff;border-radius:20px;padding:20px 16px 18px 16px;box-shadow:0 2px 10px rgba(0,0,0,0.06);margin-bottom:14px;">
+            <div style="font-size:28px;line-height:1.15;font-weight:800;letter-spacing:-0.02em;color:#111827;margin-bottom:4px;">
+              Morning News + Weather
+            </div>
+            <div style="font-size:13px;line-height:1.4;color:#6b7280;">
+              ${escapeHtml(today)}
+            </div>
+          </div>
+
+          <div style="background:#f0fdf4;background:linear-gradient(180deg,#f0fdf4 0%,#ecfdf3 100%);border:1px solid #bbf7d0;border-radius:20px;padding:16px 16px 14px 16px;box-shadow:0 2px 8px rgba(0,0,0,0.04);margin-bottom:14px;">
+            <div style="font-size:19px;font-weight:750;color:#0f172a;margin-bottom:10px;">
+              Weather
+            </div>
+
+            <div style="font-size:14px;line-height:1.55;color:#334155;">
+              <div style="margin-bottom:6px;"><strong style="color:#0f172a;">Location:</strong> ${escapeHtml(weather.location)}</div>
+              <div style="margin-bottom:6px;"><strong style="color:#0f172a;">Current:</strong> ${escapeHtml(weather.current)}</div>
+              <div style="margin-bottom:6px;"><strong style="color:#0f172a;">3:00 PM:</strong> ${escapeHtml(weather.forecast3pm)}</div>
+              <div style="margin-bottom:6px;"><strong style="color:#0f172a;">High / Low:</strong> ${escapeHtml(weather.high)} / ${escapeHtml(weather.low)}</div>
+              <div style="margin-bottom:6px;"><strong style="color:#0f172a;">Wind:</strong> ${escapeHtml(weather.wind)}</div>
+              <div style="margin-bottom:6px;"><strong style="color:#0f172a;">Precip Chance:</strong> ${escapeHtml(weather.precipChance)}</div>
+              <div style="margin-bottom:6px;"><strong style="color:#0f172a;">Sunrise / Sunset:</strong> ${escapeHtml(weather.sunrise)} / ${escapeHtml(weather.sunset)}</div>
+              <div style="margin-bottom:0;"><strong style="color:#0f172a;">Summary:</strong> ${escapeHtml(weather.summary)}</div>
+              ${weather.updated ? `<div style="margin-top:10px;font-size:12px;color:#64748b;">Updated ${escapeHtml(weather.updated)}</div>` : ""}
+            </div>
+          </div>
+
+          <div style="font-size:22px;font-weight:800;letter-spacing:-0.02em;color:#111827;margin:8px 4px 12px 4px;">
+            Top Stories
+          </div>
+  `;
+
+  let plain = `Morning News + Weather\n${today}\n\n`;
+  plain += `WEATHER\n`;
+  plain += `Location: ${weather.location}\n`;
+  plain += `Current: ${weather.current}\n`;
+  plain += `3:00 PM Forecast: ${weather.forecast3pm}\n`;
+  plain += `High/Low: ${weather.high}/${weather.low}\n`;
+  plain += `Wind: ${weather.wind}\n`;
+  plain += `Precip Chance: ${weather.precipChance}\n`;
+  plain += `Sunrise/Sunset: ${weather.sunrise}/${weather.sunset}\n`;
+  plain += `Summary: ${weather.summary}\n`;
+  if (weather.updated) plain += `Updated: ${weather.updated}\n`;
+  plain += `\nTOP ABC NEWS STORIES\n`;
+
+  items.forEach((item, idx) => {
+    let imageHtml = "";
+
+    if (item.imageUrl) {
+      try {
+        const blobResp = UrlFetchApp.fetch(item.imageUrl, {
+          muteHttpExceptions: true,
+          followRedirects: true
+        });
+
+        if (blobResp.getResponseCode() >= 200 && blobResp.getResponseCode() < 300) {
+          const blob = blobResp.getBlob();
+          const cid = `img${idx + 1}`;
+          inlineImages[cid] = blob;
+
+          imageHtml = `
+            <div style="margin:0 0 12px 0;">
+              <img src="cid:${cid}" alt="" style="display:block;width:100%;height:auto;border-radius:16px;max-width:100%;">
+            </div>
+          `;
+        }
+      } catch (e) {
+        imageHtml = "";
+      }
+    }
+
+    html += `
+      <div style="background:#ffffff;border-radius:20px;padding:14px 14px 16px 14px;box-shadow:0 2px 10px rgba(0,0,0,0.05);margin-bottom:14px;">
+        <div style="font-size:12px;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;color:#64748b;margin-bottom:8px;">
+          ${escapeHtml(item.category || `Story ${idx + 1}`)}
+        </div>
+
+        ${imageHtml}
+
+        <div style="font-size:22px;line-height:1.22;font-weight:800;letter-spacing:-0.02em;color:#0f172a;margin:0 0 10px 0;">
+          <a href="${escapeAttribute(item.link)}" style="color:#0f172a;text-decoration:none;">
+            ${escapeHtml(item.title)}
+          </a>
+        </div>
+
+        <div style="font-size:15px;line-height:1.65;color:#334155;margin-bottom:14px;">
+          ${escapeHtml(item.summary || "Summary unavailable for this article.")}
+        </div>
+
+        <a href="${escapeAttribute(item.link)}"
+           style="display:inline-block;background:#0f172a;color:#ffffff;text-decoration:none;font-size:14px;font-weight:700;padding:10px 14px;border-radius:999px;">
+          Read article
+        </a>
+      </div>
+    `;
+
+    plain += `\n${idx + 1}. [${item.category || "Story"}] ${item.title}\n`;
+    plain += `${item.summary || "Summary unavailable for this article."}\n`;
+    plain += `${item.link}\n`;
+  });
+
+  html += `
+          <div style="text-align:center;font-size:12px;line-height:1.5;color:#94a3b8;padding:8px 6px 0 6px;">
+            Generated automatically for your morning briefing
+          </div>
+
+        </div>
+      </div>
+    </body>
+  </html>
+  `;
+
+  return { htmlBody: html, plainBody: plain, inlineImages };
+}
+
+/* =========================
+   HELPERS
+========================= */
+
+function splitIntoSentences(text) {
+  const cleaned = cleanArticleText(text)
+    .replace(/([a-z])\.\s+([a-z])/g, "$1 $2");
+
+  const matches = cleaned.match(/[^.!?]+[.!?]+/g);
+  return matches ? matches.map(s => s.trim()).filter(Boolean) : [];
+}
+
+function cleanHeadline(title) {
+  return cleanArticleText(title).replace(/^(watch|video)\s*:\s*/i, "").trim();
+}
+
+function isNearDuplicateSentence(sentence, existing) {
+  const a = normalizeForCompare(sentence);
+  return existing.some(s => overlapScore(a, normalizeForCompare(s)) > 0.78);
+}
+
+function normalizeForCompare(s) {
+  return cleanArticleText(s).toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function overlapScore(a, b) {
+  const setA = new Set(a.split(" ").filter(Boolean));
+  const setB = new Set(b.split(" ").filter(Boolean));
+  if (!setA.size || !setB.size) return 0;
+
+  let overlap = 0;
+  setA.forEach(word => {
+    if (setB.has(word)) overlap++;
+  });
+
+  return overlap / Math.max(setA.size, setB.size);
+}
+
+function stripHtml(html) {
+  return decodeHtml(
+    String(html)
+      .replace(/<br\s*\/?>/gi, " ")
+      .replace(/<\/p>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+  );
+}
+
+function cleanArticleText(s) {
+  return decodeHtml(String(s || ""))
+    .replace(/#x27;|#39;|#27;/gi, "'")
+    .replace(/#x2019;|#8217;/gi, "'")
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function cleanText(s) {
+  return cleanArticleText(s);
+}
+
+function decodeHtml(str) {
+  let out = String(str || "");
+
+  for (let i = 0; i < 3; i++) {
+    const prev = out;
+
+    out = out
+      .replace(/&nbsp;/gi, " ")
+      .replace(/&amp;/gi, "&")
+      .replace(/&quot;/gi, "\"")
+      .replace(/&#39;|&apos;/gi, "'")
+      .replace(/&lt;/gi, "<")
+      .replace(/&gt;/gi, ">")
+      .replace(/&#x([0-9a-f]+);/gi, (_, hex) => safeFromCodePoint(parseInt(hex, 16)))
+      .replace(/&#([0-9]+);/g, (_, dec) => safeFromCodePoint(parseInt(dec, 10)));
+
+    if (out === prev) break;
+  }
+
+  return out;
+}
+
+function safeFromCodePoint(code) {
+  try {
+    return Number.isFinite(code) ? String.fromCodePoint(code) : "";
+  } catch (e) {
+    return "";
+  }
+}
+
+function escapeHtml(str) {
+  return String(str || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function escapeAttribute(str) {
+  return escapeHtml(str).replace(/"/g, "&quot;");
+}
+
+function escapeRegex(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
