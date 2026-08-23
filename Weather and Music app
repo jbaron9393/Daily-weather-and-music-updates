@@ -133,24 +133,31 @@ function fetchSeatGeekApiConcerts(clientId, headers, now, monthEnd, sourceUrl) {
 function fetchSeatGeekPublicConcerts(headers, sourceUrl) {
   // SeatGeek blocks requests from Google Apps Script with a 403. Jina Reader
   // renders those public SeatGeek pages as text, so no API account is needed.
-  // Fetch multiple result pages because SeatGeek's first page contains only the
-  // first couple of events rather than the complete 30-day Denver listing.
-  const requests = [];
-  for (let page = 1; page <= 10; page++) {
+  const requests = [{
+    url: "https://r.jina.ai/https://seatgeek.com/cities/denver/concerts",
+    method: "get",
+    headers: Object.assign({}, headers, { Accept: "text/plain" }),
+    muteHttpExceptions: true,
+    followRedirects: true
+  }];
+  // SeatGeek's city page is lazy-loaded and can omit cards even when page=N is
+  // requested. Double-check every requested venue's own calendar so those shows
+  // are not lost just because they were outside the city page's initial batch.
+  getTrackedDenverConcertVenues().forEach(venue => {
     requests.push({
-      url: `https://r.jina.ai/https://seatgeek.com/cities/denver/concerts?page=${page}`,
+      url: `https://r.jina.ai/https://seatgeek.com/venues/${venue.slug}/tickets`,
       method: "get",
       headers: Object.assign({}, headers, { Accept: "text/plain" }),
       muteHttpExceptions: true,
       followRedirects: true
     });
-  }
+  });
   const responses = UrlFetchApp.fetchAll(requests);
   let events = [];
 
   responses.forEach((resp, index) => {
     if (resp.getResponseCode() < 200 || resp.getResponseCode() >= 300) {
-      Logger.log(`SeatGeek reader page ${index + 1} returned ${resp.getResponseCode()}`);
+      Logger.log(`SeatGeek reader request ${index + 1} returned ${resp.getResponseCode()}`);
       return;
     }
     events = events.concat(extractSeatGeekReaderConcerts(resp.getContentText(), sourceUrl));
@@ -169,7 +176,7 @@ function fetchSeatGeekPublicConcerts(headers, sourceUrl) {
     throw new Error("SeatGeek reader did not return any Denver concerts");
   }
 
-  Logger.log(`Found ${events.length} Denver concerts across ${responses.length} SeatGeek pages.`);
+  Logger.log(`Found ${events.length} unique Denver concerts after checking the city listing and all 18 venue calendars.`);
   return events;
 }
 
@@ -188,12 +195,16 @@ function extractSeatGeekReaderConcerts(text, sourceUrl) {
     const venue = findTrackedDenverConcertVenue(`${match[1]} ${link}`);
     const dateMatch = link.match(/\b(20\d{2}-\d{2}-\d{2})\b/);
     if (!dateMatch) continue;
-    const date = new Date(`${dateMatch[1]}T12:00:00-06:00`);
+    const timeMatch = link.match(/20\d{2}-\d{2}-\d{2}-(\d{1,2})(?:-(\d{2}))?-(am|pm)\b/i);
+    let hour = timeMatch ? Number(timeMatch[1]) % 12 : 23;
+    const minute = timeMatch && timeMatch[2] ? Number(timeMatch[2]) : (timeMatch ? 0 : 59);
+    if (timeMatch && timeMatch[3].toLowerCase() === "pm") hour += 12;
+    const date = new Date(`${dateMatch[1]}T${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:00-06:00`);
     const key = `${normalizeTitleKey(title)}|${dateMatch[1]}`;
     if (!title || !venue || isNaN(date.getTime()) || seen.has(key)) continue;
 
     seen.add(key);
-    events.push({ title, venue, date, dateOnly: true, link: link || sourceUrl, score: 0, pageOrder: events.length });
+    events.push({ title, venue, date, dateOnly: !timeMatch, link: link || sourceUrl, score: 0, pageOrder: events.length });
   }
 
   return events;
@@ -248,26 +259,7 @@ function findTrackedDenverConcertVenue(value) {
     .replace(/['’]/g, "")
     .replace(/[^a-z0-9]+/g, " ")
     .trim();
-  const venues = [
-    { name: "Fiddler's Green Amphitheatre", aliases: ["fiddlers green amphitheatre", "fiddlers green amphitheater"] },
-    { name: "Cervantes' Masterpiece", aliases: ["cervantes masterpiece", "cervantes masterpiece ballroom"] },
-    { name: "Ophelia's Electric Soapbox", aliases: ["ophelias electric soapbox"] },
-    { name: "Red Rocks Amphitheatre", aliases: ["red rocks amphitheatre", "red rocks amphitheater"] },
-    { name: "Fillmore Auditorium", aliases: ["fillmore auditorium"] },
-    { name: "Levitt Pavilion", aliases: ["levitt pavilion"] },
-    { name: "Mission Ballroom", aliases: ["mission ballroom"] },
-    { name: "Summit Music Hall", aliases: ["summit music hall"] },
-    { name: "Bluebird Theater", aliases: ["bluebird theater", "bluebird theatre"] },
-    { name: "Boulder Theater", aliases: ["boulder theater", "boulder theatre"] },
-    { name: "Marquis Theater", aliases: ["marquis theater", "marquis theatre"] },
-    { name: "Gothic Theatre", aliases: ["gothic theatre", "gothic theater"] },
-    { name: "Ogden Theatre", aliases: ["ogden theatre", "ogden theater"] },
-    { name: "Ball Arena", aliases: ["ball arena"] },
-    { name: "Buffalo Rose", aliases: ["buffalo rose"] },
-    { name: "Globe Hall", aliases: ["globe hall"] },
-    { name: "Grizzly Rose", aliases: ["grizzly rose"] },
-    { name: "Junkyard", aliases: ["junkyard denver", "junkyard"] }
-  ];
+  const venues = getTrackedDenverConcertVenues();
 
   for (let i = 0; i < venues.length; i++) {
     if (venues[i].aliases.some(alias => (` ${normalized} `).indexOf(` ${alias} `) >= 0)) {
@@ -275,6 +267,29 @@ function findTrackedDenverConcertVenue(value) {
     }
   }
   return "";
+}
+
+function getTrackedDenverConcertVenues() {
+  return [
+    { name: "Fiddler's Green Amphitheatre", slug: "fiddlers-green-amphitheatre", aliases: ["fiddlers green amphitheatre", "fiddlers green amphitheater"] },
+    { name: "Cervantes' Masterpiece", slug: "cervantes-masterpiece-ballroom", aliases: ["cervantes masterpiece", "cervantes masterpiece ballroom"] },
+    { name: "Ophelia's Electric Soapbox", slug: "ophelias-electric-soapbox", aliases: ["ophelias electric soapbox"] },
+    { name: "Red Rocks Amphitheatre", slug: "red-rocks-amphitheatre", aliases: ["red rocks amphitheatre", "red rocks amphitheater", "red rocks"] },
+    { name: "Fillmore Auditorium", slug: "fillmore-auditorium-denver", aliases: ["fillmore auditorium"] },
+    { name: "Levitt Pavilion", slug: "levitt-pavilion-denver", aliases: ["levitt pavilion"] },
+    { name: "Mission Ballroom", slug: "mission-ballroom", aliases: ["mission ballroom"] },
+    { name: "Summit Music Hall", slug: "summit-music-hall", aliases: ["summit music hall"] },
+    { name: "Bluebird Theater", slug: "bluebird-theater", aliases: ["bluebird theater", "bluebird theatre"] },
+    { name: "Boulder Theater", slug: "boulder-theater", aliases: ["boulder theater", "boulder theatre"] },
+    { name: "Marquis Theater", slug: "marquis-theater-denver", aliases: ["marquis theater", "marquis theatre"] },
+    { name: "Gothic Theatre", slug: "gothic-theatre", aliases: ["gothic theatre", "gothic theater"] },
+    { name: "Ogden Theatre", slug: "ogden-theatre", aliases: ["ogden theatre", "ogden theater"] },
+    { name: "Ball Arena", slug: "ball-arena", aliases: ["ball arena"] },
+    { name: "Buffalo Rose", slug: "buffalo-rose", aliases: ["buffalo rose"] },
+    { name: "Globe Hall", slug: "globe-hall", aliases: ["globe hall"] },
+    { name: "Grizzly Rose", slug: "grizzly-rose", aliases: ["grizzly rose"] },
+    { name: "Junkyard", slug: "junkyard-denver", aliases: ["junkyard denver", "junkyard"] }
+  ];
 }
 
 function isTrackedDenverConcertVenue(venue) {
