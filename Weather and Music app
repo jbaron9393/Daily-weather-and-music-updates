@@ -10,6 +10,7 @@ function sendMorningNewsAndWeather() {
   };
 
   const weather = getWeatherSummary(LAT, LON, headers);
+  const concerts = getDenverConcerts(headers, TZ);
 
   const topCandidates = getSectionArticles("https://abcnews.go.com/", "Top", headers, 12);
   const usCandidates = getSectionArticles("https://abcnews.go.com/us", "U.S.", headers, 20);
@@ -45,7 +46,7 @@ function sendMorningNewsAndWeather() {
   const today = Utilities.formatDate(new Date(), TZ, "MMMM d, yyyy");
   const subject = today;
 
-  const { htmlBody, plainBody, inlineImages } = buildEmail(weather, enrichedItems, today);
+  const { htmlBody, plainBody, inlineImages } = buildEmail(weather, enrichedItems, concerts, today);
 
   MailApp.sendEmail({
     to: RECIPIENT,
@@ -55,6 +56,155 @@ function sendMorningNewsAndWeather() {
     inlineImages,
     name: "🌞Morning Update🌞"
   });
+}
+
+/* =========================
+   DENVER CONCERTS
+========================= */
+
+function getDenverConcerts(headers, tz) {
+  const sourceUrl = "https://seatgeek.com/cities/denver/concerts";
+  const clientId = PropertiesService.getScriptProperties().getProperty("SEATGEEK_CLIENT_ID");
+
+  if (!clientId) {
+    Logger.log(
+      "SeatGeek concerts are not configured. Add a SEATGEEK_CLIENT_ID script property " +
+      "in Project Settings after creating a free SeatGeek API application."
+    );
+    return { thisWeek: [], monthHighlights: [], sourceUrl };
+  }
+
+  try {
+    const now = new Date();
+    const weekEnd = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+    const monthEnd = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+    const params = {
+      client_id: clientId,
+      "venue.city": "Denver",
+      "venue.state": "CO",
+      "taxonomies.name": "concert",
+      "datetime_utc.gte": now.toISOString().replace(/\.\d{3}Z$/, "Z"),
+      "datetime_utc.lte": monthEnd.toISOString().replace(/\.\d{3}Z$/, "Z"),
+      per_page: 100,
+      sort: "datetime_utc.asc"
+    };
+    const apiUrl = "https://api.seatgeek.com/2/events?" + Object.keys(params)
+      .map(key => `${encodeURIComponent(key)}=${encodeURIComponent(params[key])}`)
+      .join("&");
+    const apiHeaders = Object.assign({}, headers, { Accept: "application/json" });
+    const resp = UrlFetchApp.fetch(apiUrl, {
+      method: "get",
+      headers: apiHeaders,
+      muteHttpExceptions: true,
+      followRedirects: true
+    });
+
+    if (resp.getResponseCode() < 200 || resp.getResponseCode() >= 300) {
+      Logger.log(`Failed SeatGeek API fetch (${resp.getResponseCode()}): ${resp.getContentText().slice(0, 300)}`);
+      return { thisWeek: [], monthHighlights: [], sourceUrl };
+    }
+
+    const payload = JSON.parse(resp.getContentText());
+    const events = extractSeatGeekApiConcerts(payload, sourceUrl);
+    const upcoming = events.filter(event => event.date && event.date >= now && event.date <= monthEnd);
+
+    const thisWeek = upcoming
+      .filter(event => event.date <= weekEnd)
+      .sort((a, b) => a.date - b.date);
+
+    // SeatGeek's event score is its popularity signal. Display order is used only
+    // as a stable tie-breaker, then the selected highlights are shown by date.
+    const monthHighlights = upcoming
+      .slice()
+      .sort((a, b) => (b.score - a.score) || (a.pageOrder - b.pageOrder))
+      .slice(0, 5)
+      .sort((a, b) => a.date - b.date);
+
+    thisWeek.forEach(event => event.when = formatConcertDate(event.date, tz));
+    monthHighlights.forEach(event => event.when = formatConcertDate(event.date, tz));
+
+    return { thisWeek, monthHighlights, sourceUrl };
+  } catch (e) {
+    Logger.log(`Error fetching Denver concerts from the SeatGeek API: ${e}`);
+    return { thisWeek: [], monthHighlights: [], sourceUrl };
+  }
+}
+
+function extractSeatGeekApiConcerts(payload, sourceUrl) {
+  const events = payload && Array.isArray(payload.events) ? payload.events : [];
+
+  return events.map((event, index) => {
+    const performers = Array.isArray(event.performers)
+      ? event.performers.map(performer => performer && (performer.short_name || performer.name)).filter(Boolean)
+      : [];
+    const dateValue = event.datetime_utc || event.datetime_local || "";
+    const date = new Date(dateValue);
+
+    return {
+      title: cleanText(performers.join(" & ") || event.short_title || event.title || ""),
+      venue: cleanText(event.venue && event.venue.name ? event.venue.name : ""),
+      date: isNaN(date.getTime()) ? null : date,
+      link: event.url || sourceUrl,
+      score: Number(event.score || 0) || 0,
+      pageOrder: index
+    };
+  }).filter(event => event.title && event.date);
+}
+
+function formatConcertDate(date, tz) {
+  return Utilities.formatDate(date, tz, "EEE, MMM d 'at' h:mm a");
+}
+
+function buildConcertHtml(concerts) {
+  const week = concerts && concerts.thisWeek ? concerts.thisWeek : [];
+  const highlights = concerts && concerts.monthHighlights ? concerts.monthHighlights : [];
+  const sourceUrl = concerts && concerts.sourceUrl
+    ? concerts.sourceUrl
+    : "https://seatgeek.com/cities/denver/concerts";
+
+  const renderEvent = event => `
+    <div style="padding:10px 0;border-top:1px solid #ddd6fe;">
+      <a href="${escapeAttribute(event.link)}" style="font-size:16px;font-weight:750;color:#4c1d95;text-decoration:none;">
+        ${escapeHtml(event.title)}
+      </a>
+      <div style="font-size:13px;line-height:1.45;color:#6b7280;margin-top:3px;">
+        ${escapeHtml(event.when)}${event.venue ? ` &middot; ${escapeHtml(event.venue)}` : ""}
+      </div>
+    </div>`;
+
+  const weekHtml = week.length
+    ? week.map(renderEvent).join("")
+    : `<div style="font-size:14px;color:#6b7280;padding:8px 0;">No Denver concerts were found for the next seven days.</div>`;
+  const highlightsHtml = highlights.length
+    ? highlights.map(renderEvent).join("")
+    : `<div style="font-size:14px;color:#6b7280;padding:8px 0;">No monthly highlights were available today.</div>`;
+
+  return `
+    <div style="background:#faf5ff;border:1px solid #ddd6fe;border-radius:20px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,0.04);margin-bottom:14px;">
+      <div style="font-size:19px;font-weight:750;color:#0f172a;margin-bottom:4px;">Denver Concerts</div>
+      <div style="font-size:15px;font-weight:700;color:#6d28d9;margin-top:10px;">Coming in the next 7 days</div>
+      ${weekHtml}
+      <div style="font-size:15px;font-weight:700;color:#6d28d9;margin-top:16px;">Biggest shows in the next 30 days</div>
+      ${highlightsHtml}
+      <a href="${escapeAttribute(sourceUrl)}" style="display:inline-block;color:#6d28d9;font-size:13px;font-weight:700;margin-top:12px;">See all Denver concerts on SeatGeek</a>
+    </div>`;
+}
+
+function buildConcertPlainText(concerts) {
+  const week = concerts && concerts.thisWeek ? concerts.thisWeek : [];
+  const highlights = concerts && concerts.monthHighlights ? concerts.monthHighlights : [];
+  let text = "\nDENVER CONCERTS — NEXT 7 DAYS\n";
+
+  text += week.length
+    ? week.map(event => `- ${event.title} — ${event.when}${event.venue ? ` at ${event.venue}` : ""}\n  ${event.link}`).join("\n") + "\n"
+    : "No Denver concerts were found for the next seven days.\n";
+
+  text += "\nBIGGEST DENVER SHOWS — NEXT 30 DAYS\n";
+  text += highlights.length
+    ? highlights.map(event => `- ${event.title} — ${event.when}${event.venue ? ` at ${event.venue}` : ""}\n  ${event.link}`).join("\n") + "\n"
+    : "No monthly highlights were available today.\n";
+
+  return text;
 }
 
 /* =========================
@@ -760,7 +910,7 @@ function normalizeSentence(sentence) {
    EMAIL BUILDING
 ========================= */
 
-function buildEmail(weather, items, today) {
+function buildEmail(weather, items, concerts, today) {
   const inlineImages = {};
 
   let html = `
@@ -799,6 +949,8 @@ function buildEmail(weather, items, today) {
             </div>
           </div>
 
+          ${buildConcertHtml(concerts)}
+
           <div style="font-size:22px;font-weight:800;letter-spacing:-0.02em;color:#111827;margin:8px 4px 12px 4px;">
             Top Stories
           </div>
@@ -815,6 +967,7 @@ function buildEmail(weather, items, today) {
   plain += `Sunrise/Sunset: ${weather.sunrise}/${weather.sunset}\n`;
   plain += `Summary: ${weather.summary}\n`;
   if (weather.updated) plain += `Updated: ${weather.updated}\n`;
+  plain += buildConcertPlainText(concerts);
   plain += `\nTOP ABC NEWS STORIES\n`;
 
   items.forEach((item, idx) => {
