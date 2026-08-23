@@ -92,7 +92,7 @@ function getDenverConcerts(headers, tz) {
 
     return { thisWeek, monthHighlights, sourceUrl };
   } catch (e) {
-    Logger.log(`Error fetching Denver concerts from the SeatGeek API: ${e}`);
+    Logger.log(`Error fetching Denver concerts from SeatGeek: ${e}`);
     return { thisWeek: [], monthHighlights: [], sourceUrl };
   }
 }
@@ -127,20 +127,45 @@ function fetchSeatGeekApiConcerts(clientId, headers, now, monthEnd, sourceUrl) {
 
 function fetchSeatGeekPublicConcerts(headers, sourceUrl) {
   // SeatGeek blocks requests from Google Apps Script with a 403. Jina Reader
-  // renders that same public SeatGeek page as text, so no API account is needed.
-  const readerUrl = "https://r.jina.ai/https://seatgeek.com/cities/denver/concerts";
-  const resp = UrlFetchApp.fetch(readerUrl, {
-    method: "get",
-    headers: Object.assign({}, headers, { Accept: "text/plain" }),
-    muteHttpExceptions: true,
-    followRedirects: true
+  // renders those public SeatGeek pages as text, so no API account is needed.
+  // Fetch multiple result pages because SeatGeek's first page contains only the
+  // first couple of events rather than the complete 30-day Denver listing.
+  const requests = [];
+  for (let page = 1; page <= 10; page++) {
+    requests.push({
+      url: `https://r.jina.ai/https://seatgeek.com/cities/denver/concerts?page=${page}`,
+      method: "get",
+      headers: Object.assign({}, headers, { Accept: "text/plain" }),
+      muteHttpExceptions: true,
+      followRedirects: true
+    });
+  }
+  const responses = UrlFetchApp.fetchAll(requests);
+  let events = [];
+
+  responses.forEach((resp, index) => {
+    if (resp.getResponseCode() < 200 || resp.getResponseCode() >= 300) {
+      Logger.log(`SeatGeek reader page ${index + 1} returned ${resp.getResponseCode()}`);
+      return;
+    }
+    events = events.concat(extractSeatGeekReaderConcerts(resp.getContentText(), sourceUrl));
   });
 
-  if (resp.getResponseCode() < 200 || resp.getResponseCode() >= 300) {
-    throw new Error(`SeatGeek reader returned ${resp.getResponseCode()}`);
+  const seen = new Set();
+  events = events.filter(event => {
+    const key = `${normalizeTitleKey(event.title)}|${event.date.toISOString()}|${normalizeUrlKey(event.link)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    event.pageOrder = seen.size - 1;
+    return true;
+  });
+
+  if (!events.length) {
+    throw new Error("SeatGeek reader did not return any Denver concerts");
   }
 
-  return extractSeatGeekReaderConcerts(resp.getContentText(), sourceUrl);
+  Logger.log(`Found ${events.length} Denver concerts across ${responses.length} SeatGeek pages.`);
+  return events;
 }
 
 function extractSeatGeekReaderConcerts(text, sourceUrl) {
