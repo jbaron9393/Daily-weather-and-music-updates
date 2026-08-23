@@ -150,8 +150,8 @@ function extractSeatGeekReaderConcerts(text, sourceUrl) {
   let match;
 
   while ((match = linkRe.exec(String(text || ""))) !== null) {
-    const title = cleanText(match[1].replace(/!\[[^\]]*\]\([^)]*\)/g, ""));
     const link = match[2].replace(/\\([?&])/g, "$1");
+    const title = extractSeatGeekBandName(match[1], link);
     const dateMatch = link.match(/\b(20\d{2}-\d{2}-\d{2})\b/);
     if (!dateMatch) continue;
     const date = new Date(`${dateMatch[1]}T12:00:00-06:00`);
@@ -163,6 +163,26 @@ function extractSeatGeekReaderConcerts(text, sourceUrl) {
   }
 
   return events;
+}
+
+function extractSeatGeekBandName(anchorText, eventUrl) {
+  const text = cleanText(String(anchorText || "")
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, "")
+    .replace(/^\(opens in new tab\)\s*/i, ""));
+  const ticketText = text.match(/Find tickets to (.+?) on (?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),?\s/i);
+  if (ticketText && ticketText[1]) return cleanText(ticketText[1]);
+
+  // The rendered link text can contain the entire event card. SeatGeek's event
+  // URL starts with the performer slug, which is a safer fallback than showing it.
+  const slugMatch = String(eventUrl || "").match(/seatgeek\.com\/([^/?]+)-tickets\/denver/i);
+  if (slugMatch && slugMatch[1]) {
+    return slugMatch[1]
+      .split("-")
+      .map(word => word ? word.charAt(0).toUpperCase() + word.slice(1) : "")
+      .join(" ");
+  }
+
+  return text;
 }
 
 function extractSeatGeekApiConcerts(payload, sourceUrl) {
@@ -202,9 +222,6 @@ function buildConcertHtml(concerts) {
       <a href="${escapeAttribute(event.link)}" style="font-size:16px;font-weight:750;color:#4c1d95;text-decoration:none;">
         ${escapeHtml(event.title)}
       </a>
-      <div style="font-size:13px;line-height:1.45;color:#6b7280;margin-top:3px;">
-        ${escapeHtml(event.when)}${event.venue ? ` &middot; ${escapeHtml(event.venue)}` : ""}
-      </div>
     </div>`;
 
   const weekHtml = week.length
@@ -231,12 +248,12 @@ function buildConcertPlainText(concerts) {
   let text = "\nDENVER CONCERTS — NEXT 7 DAYS\n";
 
   text += week.length
-    ? week.map(event => `- ${event.title} — ${event.when}${event.venue ? ` at ${event.venue}` : ""}\n  ${event.link}`).join("\n") + "\n"
+    ? week.map(event => `- ${event.title}\n  ${event.link}`).join("\n") + "\n"
     : "No Denver concerts were found for the next seven days.\n";
 
   text += "\nBIGGEST DENVER SHOWS — NEXT 30 DAYS\n";
   text += highlights.length
-    ? highlights.map(event => `- ${event.title} — ${event.when}${event.venue ? ` at ${event.venue}` : ""}\n  ${event.link}`).join("\n") + "\n"
+    ? highlights.map(event => `- ${event.title}\n  ${event.link}`).join("\n") + "\n"
     : "No monthly highlights were available today.\n";
 
   return text;
