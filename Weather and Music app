@@ -73,7 +73,12 @@ function getDenverConcerts(headers, tz) {
     const events = clientId
       ? fetchSeatGeekApiConcerts(clientId, headers, now, monthEnd, sourceUrl)
       : fetchSeatGeekPublicConcerts(headers, sourceUrl);
-    const upcoming = events.filter(event => event.date && event.date >= now && event.date <= monthEnd);
+    const upcoming = events.filter(event =>
+      event.date &&
+      event.date >= now &&
+      event.date <= monthEnd &&
+      isTrackedDenverConcertVenue(event.venue)
+    );
 
     const thisWeek = upcoming
       .filter(event => event.date <= weekEnd)
@@ -180,14 +185,15 @@ function extractSeatGeekReaderConcerts(text, sourceUrl) {
   while ((match = linkRe.exec(String(text || ""))) !== null) {
     const link = match[2].replace(/\\([?&])/g, "$1");
     const title = extractSeatGeekBandName(match[1], link);
+    const venue = findTrackedDenverConcertVenue(`${match[1]} ${link}`);
     const dateMatch = link.match(/\b(20\d{2}-\d{2}-\d{2})\b/);
     if (!dateMatch) continue;
     const date = new Date(`${dateMatch[1]}T12:00:00-06:00`);
     const key = `${normalizeTitleKey(title)}|${dateMatch[1]}`;
-    if (!title || isNaN(date.getTime()) || seen.has(key)) continue;
+    if (!title || !venue || isNaN(date.getTime()) || seen.has(key)) continue;
 
     seen.add(key);
-    events.push({ title, venue: "", date, dateOnly: true, link: link || sourceUrl, score: 0, pageOrder: events.length });
+    events.push({ title, venue, date, dateOnly: true, link: link || sourceUrl, score: 0, pageOrder: events.length });
   }
 
   return events;
@@ -223,15 +229,56 @@ function extractSeatGeekApiConcerts(payload, sourceUrl) {
     const dateValue = event.datetime_utc || event.datetime_local || "";
     const date = new Date(dateValue);
 
+    const venue = findTrackedDenverConcertVenue(event.venue && event.venue.name ? event.venue.name : "");
+
     return {
       title: cleanText(performers.join(" & ") || event.short_title || event.title || ""),
-      venue: cleanText(event.venue && event.venue.name ? event.venue.name : ""),
+      venue,
       date: isNaN(date.getTime()) ? null : date,
       link: event.url || sourceUrl,
       score: Number(event.score || 0) || 0,
       pageOrder: index
     };
-  }).filter(event => event.title && event.date);
+  }).filter(event => event.title && event.date && event.venue);
+}
+
+function findTrackedDenverConcertVenue(value) {
+  const normalized = cleanText(value || "")
+    .toLowerCase()
+    .replace(/['’]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+  const venues = [
+    { name: "Fiddler's Green Amphitheatre", aliases: ["fiddlers green amphitheatre", "fiddlers green amphitheater"] },
+    { name: "Cervantes' Masterpiece", aliases: ["cervantes masterpiece", "cervantes masterpiece ballroom"] },
+    { name: "Ophelia's Electric Soapbox", aliases: ["ophelias electric soapbox"] },
+    { name: "Red Rocks Amphitheatre", aliases: ["red rocks amphitheatre", "red rocks amphitheater"] },
+    { name: "Fillmore Auditorium", aliases: ["fillmore auditorium"] },
+    { name: "Levitt Pavilion", aliases: ["levitt pavilion"] },
+    { name: "Mission Ballroom", aliases: ["mission ballroom"] },
+    { name: "Summit Music Hall", aliases: ["summit music hall"] },
+    { name: "Bluebird Theater", aliases: ["bluebird theater", "bluebird theatre"] },
+    { name: "Boulder Theater", aliases: ["boulder theater", "boulder theatre"] },
+    { name: "Marquis Theater", aliases: ["marquis theater", "marquis theatre"] },
+    { name: "Gothic Theatre", aliases: ["gothic theatre", "gothic theater"] },
+    { name: "Ogden Theatre", aliases: ["ogden theatre", "ogden theater"] },
+    { name: "Ball Arena", aliases: ["ball arena"] },
+    { name: "Buffalo Rose", aliases: ["buffalo rose"] },
+    { name: "Globe Hall", aliases: ["globe hall"] },
+    { name: "Grizzly Rose", aliases: ["grizzly rose"] },
+    { name: "Junkyard", aliases: ["junkyard denver", "junkyard"] }
+  ];
+
+  for (let i = 0; i < venues.length; i++) {
+    if (venues[i].aliases.some(alias => (` ${normalized} `).indexOf(` ${alias} `) >= 0)) {
+      return venues[i].name;
+    }
+  }
+  return "";
+}
+
+function isTrackedDenverConcertVenue(venue) {
+  return Boolean(findTrackedDenverConcertVenue(venue));
 }
 
 function formatConcertDate(date, tz, dateOnly) {
