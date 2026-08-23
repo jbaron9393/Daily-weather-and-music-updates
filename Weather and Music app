@@ -171,7 +171,10 @@ function fetchSeatGeekPublicConcerts(headers, sourceUrl) {
 function extractSeatGeekReaderConcerts(text, sourceUrl) {
   const events = [];
   const seen = new Set();
-  const linkRe = /\[([^\]]+)\]\((https?:\/\/(?:www\.)?seatgeek\.com\/[^)]+-tickets\/denver[^)]*)\)/gi;
+  // The Denver SeatGeek page includes the full metro area. Do not require
+  // "/denver" in the event URL: Red Rocks uses Morrison, Fiddler's Green uses
+  // Englewood, and other listed shows use Boulder, Golden, and nearby cities.
+  const linkRe = /\[([^\]]+)\]\((https?:\/\/(?:www\.)?seatgeek\.com\/[^)]+-tickets\/[^)]*20\d{2}-\d{2}-\d{2}[^)]*)\)/gi;
   let match;
 
   while ((match = linkRe.exec(String(text || ""))) !== null) {
@@ -199,7 +202,7 @@ function extractSeatGeekBandName(anchorText, eventUrl) {
 
   // The rendered link text can contain the entire event card. SeatGeek's event
   // URL starts with the performer slug, which is a safer fallback than showing it.
-  const slugMatch = String(eventUrl || "").match(/seatgeek\.com\/([^/?]+)-tickets\/denver/i);
+  const slugMatch = String(eventUrl || "").match(/seatgeek\.com\/([^/?]+)-tickets\//i);
   if (slugMatch && slugMatch[1]) {
     return slugMatch[1]
       .split("-")
