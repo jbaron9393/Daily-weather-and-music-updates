@@ -84,7 +84,7 @@ function getDenverConcerts(headers, tz) {
     const monthHighlights = upcoming
       .slice()
       .sort((a, b) => (b.score - a.score) || (a.pageOrder - b.pageOrder))
-      .slice(0, 5)
+      .slice(0, 10)
       .sort((a, b) => a.date - b.date);
 
     thisWeek.forEach(event => event.when = formatConcertDate(event.date, tz, event.dateOnly));
@@ -236,7 +236,7 @@ function buildConcertHtml(concerts) {
       <div style="font-size:19px;font-weight:750;color:#0f172a;margin-bottom:4px;">Denver Concerts</div>
       <div style="font-size:15px;font-weight:700;color:#6d28d9;margin-top:10px;">Coming in the next 7 days</div>
       ${weekHtml}
-      <div style="font-size:15px;font-weight:700;color:#6d28d9;margin-top:16px;">Biggest shows in the next 30 days</div>
+      <div style="font-size:15px;font-weight:700;color:#6d28d9;margin-top:16px;">Top 10 shows in the next 30 days</div>
       ${highlightsHtml}
       <a href="${escapeAttribute(sourceUrl)}" style="display:inline-block;color:#6d28d9;font-size:13px;font-weight:700;margin-top:12px;">See all Denver concerts on SeatGeek</a>
     </div>`;
@@ -251,7 +251,7 @@ function buildConcertPlainText(concerts) {
     ? week.map(event => `- ${event.title}\n  ${event.link}`).join("\n") + "\n"
     : "No Denver concerts were found for the next seven days.\n";
 
-  text += "\nBIGGEST DENVER SHOWS — NEXT 30 DAYS\n";
+  text += "\nTOP 10 DENVER SHOWS — NEXT 30 DAYS\n";
   text += highlights.length
     ? highlights.map(event => `- ${event.title}\n  ${event.link}`).join("\n") + "\n"
     : "No monthly highlights were available today.\n";
