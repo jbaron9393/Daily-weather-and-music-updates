@@ -66,46 +66,13 @@ function getDenverConcerts(headers, tz) {
   const sourceUrl = "https://seatgeek.com/cities/denver/concerts";
   const clientId = PropertiesService.getScriptProperties().getProperty("SEATGEEK_CLIENT_ID");
 
-  if (!clientId) {
-    Logger.log(
-      "SeatGeek concerts are not configured. Add a SEATGEEK_CLIENT_ID script property " +
-      "in Project Settings after creating a free SeatGeek API application."
-    );
-    return { thisWeek: [], monthHighlights: [], sourceUrl };
-  }
-
   try {
     const now = new Date();
     const weekEnd = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
     const monthEnd = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
-    const params = {
-      client_id: clientId,
-      "venue.city": "Denver",
-      "venue.state": "CO",
-      "taxonomies.name": "concert",
-      "datetime_utc.gte": now.toISOString().replace(/\.\d{3}Z$/, "Z"),
-      "datetime_utc.lte": monthEnd.toISOString().replace(/\.\d{3}Z$/, "Z"),
-      per_page: 100,
-      sort: "datetime_utc.asc"
-    };
-    const apiUrl = "https://api.seatgeek.com/2/events?" + Object.keys(params)
-      .map(key => `${encodeURIComponent(key)}=${encodeURIComponent(params[key])}`)
-      .join("&");
-    const apiHeaders = Object.assign({}, headers, { Accept: "application/json" });
-    const resp = UrlFetchApp.fetch(apiUrl, {
-      method: "get",
-      headers: apiHeaders,
-      muteHttpExceptions: true,
-      followRedirects: true
-    });
-
-    if (resp.getResponseCode() < 200 || resp.getResponseCode() >= 300) {
-      Logger.log(`Failed SeatGeek API fetch (${resp.getResponseCode()}): ${resp.getContentText().slice(0, 300)}`);
-      return { thisWeek: [], monthHighlights: [], sourceUrl };
-    }
-
-    const payload = JSON.parse(resp.getContentText());
-    const events = extractSeatGeekApiConcerts(payload, sourceUrl);
+    const events = clientId
+      ? fetchSeatGeekApiConcerts(clientId, headers, now, monthEnd, sourceUrl)
+      : fetchSeatGeekPublicConcerts(headers, sourceUrl);
     const upcoming = events.filter(event => event.date && event.date >= now && event.date <= monthEnd);
 
     const thisWeek = upcoming
@@ -120,14 +87,82 @@ function getDenverConcerts(headers, tz) {
       .slice(0, 5)
       .sort((a, b) => a.date - b.date);
 
-    thisWeek.forEach(event => event.when = formatConcertDate(event.date, tz));
-    monthHighlights.forEach(event => event.when = formatConcertDate(event.date, tz));
+    thisWeek.forEach(event => event.when = formatConcertDate(event.date, tz, event.dateOnly));
+    monthHighlights.forEach(event => event.when = formatConcertDate(event.date, tz, event.dateOnly));
 
     return { thisWeek, monthHighlights, sourceUrl };
   } catch (e) {
     Logger.log(`Error fetching Denver concerts from the SeatGeek API: ${e}`);
     return { thisWeek: [], monthHighlights: [], sourceUrl };
   }
+}
+
+function fetchSeatGeekApiConcerts(clientId, headers, now, monthEnd, sourceUrl) {
+  const params = {
+    client_id: clientId,
+    "venue.city": "Denver",
+    "venue.state": "CO",
+    "taxonomies.name": "concert",
+    "datetime_utc.gte": now.toISOString().replace(/\.\d{3}Z$/, "Z"),
+    "datetime_utc.lte": monthEnd.toISOString().replace(/\.\d{3}Z$/, "Z"),
+    per_page: 100,
+    sort: "datetime_utc.asc"
+  };
+  const apiUrl = "https://api.seatgeek.com/2/events?" + Object.keys(params)
+    .map(key => `${encodeURIComponent(key)}=${encodeURIComponent(params[key])}`)
+    .join("&");
+  const resp = UrlFetchApp.fetch(apiUrl, {
+    method: "get",
+    headers: Object.assign({}, headers, { Accept: "application/json" }),
+    muteHttpExceptions: true,
+    followRedirects: true
+  });
+
+  if (resp.getResponseCode() < 200 || resp.getResponseCode() >= 300) {
+    throw new Error(`SeatGeek API returned ${resp.getResponseCode()}: ${resp.getContentText().slice(0, 300)}`);
+  }
+
+  return extractSeatGeekApiConcerts(JSON.parse(resp.getContentText()), sourceUrl);
+}
+
+function fetchSeatGeekPublicConcerts(headers, sourceUrl) {
+  // SeatGeek blocks requests from Google Apps Script with a 403. Jina Reader
+  // renders that same public SeatGeek page as text, so no API account is needed.
+  const readerUrl = "https://r.jina.ai/https://seatgeek.com/cities/denver/concerts";
+  const resp = UrlFetchApp.fetch(readerUrl, {
+    method: "get",
+    headers: Object.assign({}, headers, { Accept: "text/plain" }),
+    muteHttpExceptions: true,
+    followRedirects: true
+  });
+
+  if (resp.getResponseCode() < 200 || resp.getResponseCode() >= 300) {
+    throw new Error(`SeatGeek reader returned ${resp.getResponseCode()}`);
+  }
+
+  return extractSeatGeekReaderConcerts(resp.getContentText(), sourceUrl);
+}
+
+function extractSeatGeekReaderConcerts(text, sourceUrl) {
+  const events = [];
+  const seen = new Set();
+  const linkRe = /\[([^\]]+)\]\((https?:\/\/(?:www\.)?seatgeek\.com\/[^)]+-tickets\/denver[^)]*)\)/gi;
+  let match;
+
+  while ((match = linkRe.exec(String(text || ""))) !== null) {
+    const title = cleanText(match[1].replace(/!\[[^\]]*\]\([^)]*\)/g, ""));
+    const link = match[2].replace(/\\([?&])/g, "$1");
+    const dateMatch = link.match(/\b(20\d{2}-\d{2}-\d{2})\b/);
+    if (!dateMatch) continue;
+    const date = new Date(`${dateMatch[1]}T12:00:00-06:00`);
+    const key = `${normalizeTitleKey(title)}|${dateMatch[1]}`;
+    if (!title || isNaN(date.getTime()) || seen.has(key)) continue;
+
+    seen.add(key);
+    events.push({ title, venue: "", date, dateOnly: true, link: link || sourceUrl, score: 0, pageOrder: events.length });
+  }
+
+  return events;
 }
 
 function extractSeatGeekApiConcerts(payload, sourceUrl) {
@@ -151,8 +186,8 @@ function extractSeatGeekApiConcerts(payload, sourceUrl) {
   }).filter(event => event.title && event.date);
 }
 
-function formatConcertDate(date, tz) {
-  return Utilities.formatDate(date, tz, "EEE, MMM d 'at' h:mm a");
+function formatConcertDate(date, tz, dateOnly) {
+  return Utilities.formatDate(date, tz, dateOnly ? "EEE, MMM d" : "EEE, MMM d 'at' h:mm a");
 }
 
 function buildConcertHtml(concerts) {
